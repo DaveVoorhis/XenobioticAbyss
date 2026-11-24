@@ -1,0 +1,24 @@
+# Dependencies
+node_modules/
+
+# Production build & test artifacts
+dist/
+coverage/
+
+# Environment files
+.env
+.env.*
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE / Agent files
+.idea/
+*.iml
+.vscode/
+skills/
