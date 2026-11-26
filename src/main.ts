@@ -34,7 +34,7 @@ class XenobioticApp {
     this.audio = new AmbientAudioEngine(this.events);
     this.hud = new HudController(this.sim, this.sceneRenderer, this.audio);
 
-    this.sim.seedPreset('balanced_reef');
+    this.sim.seedPreset('balanced_reef', { emergeFromVent: true });
 
     const splash = document.getElementById('loading-overlay');
     if (splash) {

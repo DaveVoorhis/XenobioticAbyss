@@ -506,7 +506,11 @@ export class SceneRenderer {
     const daylight = computeDaylightFactor(this.sim.env.timeOfDay);
     this.scene.environmentIntensity = 0.38 + daylight * 0.72;
     // When simulation is paused, still allow manual Biogenesis/Phytogenesis flare to dim out
-    if (this.sim.simSpeed <= 0 && this.sim.ventPulseEnergy > 0) {
+    if (
+      this.sim.simSpeed <= 0 &&
+      this.sim.ventPulseEnergy > 0 &&
+      !this.sim.isInitialVentGenesisActive()
+    ) {
       this.sim.ventPulseEnergy = Math.max(0.0, this.sim.ventPulseEnergy - realDt * 0.28);
     }
 

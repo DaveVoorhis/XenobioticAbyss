@@ -63,7 +63,7 @@ export class EnvironmentControlPanel {
         btn.title = p.description;
         btn.textContent = p.name;
         btn.addEventListener('click', () => {
-          this.sim.seedPreset(p.id);
+          this.sim.seedPreset(p.id, { emergeFromVent: true });
           this.syncFromEnv();
           this.onPresetLoaded(p.id);
           this.sim.events.emit('toast', { message: `Loaded: ${p.name}` });

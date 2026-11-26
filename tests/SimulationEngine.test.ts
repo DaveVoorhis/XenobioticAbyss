@@ -578,4 +578,66 @@ describe('SimulationEngine', () => {
     sim.triggerBiogenesis();
     expect(sim.getVentGlowLevel()).toBeCloseTo(1.0, 4);
   });
+
+  it('emerges initial preset creatures in staggered waves from the Genesis Vent on launch', () => {
+    const sim = new SimulationEngine();
+    const spawnedAnimals: Array<{ pos: THREE.Vector3; vel: THREE.Vector3 }> = [];
+    let shockwaveCount = 0;
+
+    sim.events.on('entity:spawned', ({ entity }) => {
+      if (entity.kind === 'animal') {
+        spawnedAnimals.push({ pos: entity.position.clone(), vel: entity.velocity.clone() });
+      }
+    });
+    sim.events.on('fx:shockwave', () => {
+      shockwaveCount++;
+    });
+
+    sim.seedPreset('balanced_reef', { emergeFromVent: true });
+
+    // Flora is rooted immediately while initial fauna are queued to emerge from the vent
+    expect(sim.plants.length).toBeGreaterThan(20);
+    expect(sim.animals.length).toBe(0);
+    expect(sim.isInitialVentGenesisActive()).toBe(true);
+    expect(sim.getVentGlowLevel()).toBeGreaterThan(0.4);
+
+    // Advance ~1.0s: first creatures should already be emerging, still mid-eruption
+    for (let i = 0; i < 20; i++) sim.step(0.05);
+    expect(spawnedAnimals.length).toBeGreaterThan(0);
+    expect(sim.isInitialVentGenesisActive()).toBe(true);
+    expect(sim.getVentGlowLevel()).toBeGreaterThan(0.5);
+
+    // Step until initial vent emergence finishes (~10-12s max)
+    for (let i = 0; i < 300 && sim.isInitialVentGenesisActive(); i++) {
+      sim.step(0.05);
+    }
+    expect(sim.isInitialVentGenesisActive()).toBe(false);
+    expect(spawnedAnimals.length).toBeGreaterThanOrEqual(28);
+    expect(shockwaveCount).toBeGreaterThanOrEqual(6);
+    expect(sim.getActiveSpeciesCount()).toBeGreaterThan(8);
+
+    // Every initial creature emerged right from the Genesis Vent orifice heading upward
+    for (const s of spawnedAnimals) {
+      const horizDist = Math.hypot(s.pos.x - TANK.ventPos.x, s.pos.z - TANK.ventPos.z);
+      expect(horizDist).toBeLessThan(0.35);
+      expect(s.pos.y).toBeGreaterThanOrEqual(TANK.ventPos.y + 1.95);
+      expect(s.pos.y).toBeLessThanOrEqual(TANK.ventPos.y + 2.45);
+      expect(s.vel.y).toBeGreaterThan(0.35);
+    }
+
+    // After emergence completes, vent glow smoothly extinguishes back to dormant darkness
+    sim.env.autoGenesisEnabled = false;
+    for (let i = 0; i < 90; i++) sim.step(0.05);
+    expect(sim.getVentGlowLevel()).toBe(0);
+
+    // Verify clearAll cancels any in-progress vent emergence queue cleanly
+    const sim2 = new SimulationEngine();
+    sim2.seedPreset('balanced_reef', { emergeFromVent: true });
+    expect(sim2.isInitialVentGenesisActive()).toBe(true);
+    sim2.clearAll();
+    expect(sim2.isInitialVentGenesisActive()).toBe(false);
+    sim2.env.autoGenesisEnabled = false;
+    for (let i = 0; i < 60; i++) sim2.step(0.05);
+    expect(sim2.animals.length).toBe(0);
+  });
 });

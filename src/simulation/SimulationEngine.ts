@@ -18,6 +18,7 @@ import {
   randomWeightedPointInReef,
   randRange,
   safeNormalize,
+  safeOrientToward,
 } from '../core/math';
 import {
   createAnimalGenome,
@@ -68,6 +69,23 @@ import type {
   PropaguleEntity,
   SimulationSnapshot,
 } from './types';
+
+export interface SeedPresetOptions {
+  /**
+   * When true, initial fauna emerge in staggered waves directly out of the
+   * hydrothermal Genesis Vent rather than appearing pre-scattered in the reef.
+   */
+  emergeFromVent?: boolean;
+}
+
+interface PendingVentSpawn {
+  delay: number;
+  genome: AnimalGenome;
+  stage: AnimalLifeStage;
+  azimuth: number;
+  waveStart: boolean;
+  spawnEgg: boolean;
+}
 
 export interface SimulationContext {
   readonly simTime: number;
@@ -133,6 +151,10 @@ export class SimulationEngine implements SimulationContext {
   private genesisToggle = 0;
   private lastHistoryT = 0;
   private lastSpeciesRecomputeT = 0;
+  private readonly pendingVentSpawns: PendingVentSpawn[] = [];
+  private ventSpawnTimer = 0;
+  private ventInitialBuildUp = false;
+  private ventAzimuthCursor = 0;
 
   private readonly animalBehavior = new AnimalBehaviorSystem();
   private readonly plantEcology = new PlantEcologySystem();
@@ -141,6 +163,10 @@ export class SimulationEngine implements SimulationContext {
   constructor(events: EventBus = new EventBus()) {
     this.events = events;
     TANK.ventPos.y = getSeabedHeight(TANK.ventPos.x, TANK.ventPos.z);
+  }
+
+  isInitialVentGenesisActive(): boolean {
+    return this.pendingVentSpawns.length > 0;
   }
 
   log(message: string, category: LogCategory, toneClass = 'text-cyan-100'): void {
@@ -175,10 +201,16 @@ export class SimulationEngine implements SimulationContext {
     this.lastSpeciesRecomputeT = 0;
     this.genesisCountdown = this.env.genesisInterval * 0.82;
     this.ventPulseEnergy = 0.0;
+    this.pendingVentSpawns.length = 0;
+    this.ventSpawnTimer = 0;
+    this.ventInitialBuildUp = false;
     this.events.emit('ecosystem:reset', {});
   }
 
-  seedPreset(presetId: EcosystemPresetId = 'balanced_reef'): void {
+  seedPreset(
+    presetId: EcosystemPresetId = 'balanced_reef',
+    options: SeedPresetOptions = {}
+  ): void {
     this.clearAll();
     const presetMeta = ECOSYSTEM_PRESETS.find((p) => p.id === presetId) ?? ECOSYSTEM_PRESETS[0];
     this.env.timeOfDay = presetMeta.timeOfDay;
@@ -263,42 +295,187 @@ export class SimulationEngine implements SimulationContext {
       }
     }
 
-    for (const as of animalSpecs) {
-      const g = createAnimalGenome(as.diet, as.plan);
-      const center = randomWeightedPointInReef(TANK.coreRadius * 0.85, TANK.coreRadius + 1.8);
-      const cy = randRange(3.2, TANK.waterY - 2.4);
-      for (let k = 0; k < as.n; k++) {
-        const p = new THREE.Vector3(
-          center.x + randRange(-2.3, 2.3),
-          clamp(cy + randRange(-1.5, 1.5), 2.2, TANK.waterY - 1.5),
-          center.z + randRange(-2.3, 2.3)
-        );
-        clampToTankRadius(p, 1.2);
-        let stage: AnimalLifeStage = 'adult';
-        if (k === as.n - 1) {
-          stage = getIntermediateStage(g);
-        } else if (as.n >= 4 && k === as.n - 2) {
-          if (g.reproduction === 'Egg_Layer') {
-            const eggPos = p.clone();
-            eggPos.y = getSeabedHeight(eggPos.x, eggPos.z) + randRange(0.25, 1.4);
-            const egg = this.spawnEgg(g, eggPos);
-            if (egg) egg.age = randRange(0, egg.incubateDuration * 0.55);
-            stage = 'adult';
-          } else {
-            stage = 'spawn';
+    if (options.emergeFromVent) {
+      const reefCenterAzimuth = Math.atan2(-TANK.ventPos.z, -TANK.ventPos.x);
+      const waveCount = Math.max(1, animalSpecs.length);
+      for (let w = 0; w < animalSpecs.length; w++) {
+        const as = animalSpecs[w];
+        const g = createAnimalGenome(as.diet, as.plan);
+        const waveAzimuth =
+          reefCenterAzimuth + (w / waveCount) * Math.PI * 2 + randRange(-0.22, 0.22);
+        for (let k = 0; k < as.n; k++) {
+          let stage: AnimalLifeStage = 'adult';
+          let spawnEgg = false;
+          if (k === as.n - 1) {
+            stage = getIntermediateStage(g);
+          } else if (as.n >= 4 && k === as.n - 2) {
+            if (g.reproduction === 'Egg_Layer') {
+              spawnEgg = true;
+              stage = 'adult';
+            } else {
+              stage = 'spawn';
+            }
           }
+          const delay =
+            w === 0 && k === 0
+              ? 0.35
+              : k === 0
+              ? randRange(0.42, 0.56)
+              : randRange(0.15, 0.22);
+          this.pendingVentSpawns.push({
+            delay,
+            genome: g,
+            stage,
+            azimuth: waveAzimuth,
+            waveStart: k === 0,
+            spawnEgg,
+          });
         }
-        this.spawnAnimal(g, p, stage);
       }
+
+      this.ventSpawnTimer = this.pendingVentSpawns[0]?.delay ?? 0;
+      this.ventInitialBuildUp = this.pendingVentSpawns.length > 0;
+      this.ventPulseEnergy = this.pendingVentSpawns.length > 0 ? 0.65 : 0.0;
+      this.genesisCountdown = this.env.genesisInterval;
+
+      this.speciesRegistry.recomputeCounts(this.animals, this.plants, this.simTime);
+      this.log(
+        `${presetMeta.name} seeded — ${this.pendingVentSpawns.length} fauna emerging from the Genesis Vent (${this.plants.length} flora).`,
+        'genesis',
+        'text-cyan-200'
+      );
+      this.recordHistory();
+    } else {
+      for (const as of animalSpecs) {
+        const g = createAnimalGenome(as.diet, as.plan);
+        const center = randomWeightedPointInReef(TANK.coreRadius * 0.85, TANK.coreRadius + 1.8);
+        const cy = randRange(3.2, TANK.waterY - 2.4);
+        for (let k = 0; k < as.n; k++) {
+          const p = new THREE.Vector3(
+            center.x + randRange(-2.3, 2.3),
+            clamp(cy + randRange(-1.5, 1.5), 2.2, TANK.waterY - 1.5),
+            center.z + randRange(-2.3, 2.3)
+          );
+          clampToTankRadius(p, 1.2);
+          let stage: AnimalLifeStage = 'adult';
+          if (k === as.n - 1) {
+            stage = getIntermediateStage(g);
+          } else if (as.n >= 4 && k === as.n - 2) {
+            if (g.reproduction === 'Egg_Layer') {
+              const eggPos = p.clone();
+              eggPos.y = getSeabedHeight(eggPos.x, eggPos.z) + randRange(0.25, 1.4);
+              const egg = this.spawnEgg(g, eggPos);
+              if (egg) egg.age = randRange(0, egg.incubateDuration * 0.55);
+              stage = 'adult';
+            } else {
+              stage = 'spawn';
+            }
+          }
+          this.spawnAnimal(g, p, stage);
+        }
+      }
+
+      this.speciesRegistry.recomputeCounts(this.animals, this.plants, this.simTime);
+      this.log(
+        `${presetMeta.name} seeded (${this.animals.length} fauna, ${this.plants.length} flora).`,
+        'system',
+        'text-cyan-200'
+      );
+      this.recordHistory();
+    }
+  }
+
+  private launchAnimalFromVent(
+    genome: AnimalGenome,
+    stage: AnimalLifeStage,
+    azimuth: number
+  ): AnimalEntity | null {
+    const jitterR = randRange(0.03, 0.22);
+    const jitterAng = randRange(0, Math.PI * 2);
+    const pos = new THREE.Vector3(
+      TANK.ventPos.x + Math.cos(jitterAng) * jitterR,
+      TANK.ventPos.y + randRange(2.05, 2.34),
+      TANK.ventPos.z + Math.sin(jitterAng) * jitterR
+    );
+    const heading = azimuth + randRange(-0.34, 0.34);
+    const launchDir = new THREE.Vector3(
+      Math.cos(heading),
+      randRange(0.82, 1.38),
+      Math.sin(heading)
+    ).normalize();
+    const launchSpeed = Math.max(1.4, genome.speed * 1.05);
+    const launchVel = launchDir.multiplyScalar(launchSpeed);
+
+    const a = this.spawnAnimal(genome, pos, stage, launchVel);
+    if (!a) return null;
+    a.wanderDir
+      .set(Math.cos(heading), randRange(-0.08, 0.26), Math.sin(heading))
+      .normalize();
+    a.wanderTimer = randRange(3.2, 5.2);
+    a.attackCooldown = 2.0;
+    a.moltAnim = 0.72;
+    return a;
+  }
+
+  private updateInitialVentGenesis(dt: number): void {
+    if (this.pendingVentSpawns.length === 0) return;
+
+    if (this.ventInitialBuildUp) {
+      this.ventPulseEnergy = Math.min(0.95, this.ventPulseEnergy + dt * 1.1);
+    } else {
+      this.ventPulseEnergy = Math.max(this.ventPulseEnergy, 0.78);
     }
 
-    this.speciesRegistry.recomputeCounts(this.animals, this.plants, this.simTime);
-    this.log(
-      `${presetMeta.name} seeded (${this.animals.length} fauna, ${this.plants.length} flora).`,
-      'system',
-      'text-cyan-200'
-    );
-    this.recordHistory();
+    this.ventSpawnTimer -= dt;
+    while (this.pendingVentSpawns.length > 0 && this.ventSpawnTimer <= 0) {
+      const item = this.pendingVentSpawns.shift()!;
+      this.ventInitialBuildUp = false;
+      this.ventPulseEnergy = 1.0;
+
+      const origin = new THREE.Vector3(TANK.ventPos.x, TANK.ventPos.y + 2.25, TANK.ventPos.z);
+      if (item.waveStart) {
+        this.events.emit('fx:shockwave', { position: origin, colorHex: 0x48f5ff });
+        this.events.emit('fx:burst', {
+          position: origin,
+          colorHex: item.genome.glowHex,
+          count: 14,
+          speed: 2.5,
+        });
+        this.events.emit('audio:cue', { type: 'biogenesis' });
+        this.log(
+          `Genesis Vent: ${item.genome.speciesName} (${item.genome.bodyPlan.replace(/_/g, ' ')}, ${item.genome.diet})`,
+          'genesis',
+          'text-cyan-300'
+        );
+      } else {
+        this.events.emit('fx:burst', {
+          position: origin,
+          colorHex: item.genome.glowHex,
+          count: 5,
+          speed: 1.85,
+        });
+      }
+
+      this.launchAnimalFromVent(item.genome, item.stage, item.azimuth);
+
+      if (item.spawnEgg && this.eggs.length < CAPS.maxEggs) {
+        const eggPos = new THREE.Vector3(
+          TANK.ventPos.x + Math.cos(item.azimuth) * randRange(0.65, 1.15),
+          TANK.ventPos.y + 2.38,
+          TANK.ventPos.z + Math.sin(item.azimuth) * randRange(0.65, 1.15)
+        );
+        const egg = this.spawnEgg(item.genome, eggPos);
+        if (egg) egg.age = randRange(0, egg.incubateDuration * 0.55);
+      }
+
+      if (this.pendingVentSpawns.length > 0) {
+        this.ventSpawnTimer += this.pendingVentSpawns[0].delay;
+      } else {
+        this.ventSpawnTimer = 0;
+        this.genesisCountdown = this.env.genesisInterval;
+        this.speciesRegistry.recomputeCounts(this.animals, this.plants, this.simTime);
+      }
+    }
   }
 
   triggerBiogenesis(
@@ -319,13 +496,12 @@ export class SimulationEngine implements SimulationContext {
     }
     const n = Math.min(3, room);
     const spawned: AnimalEntity[] = [];
+    const baseAz = this.ventAzimuthCursor;
+    this.ventAzimuthCursor = (this.ventAzimuthCursor + 2.39996) % (Math.PI * 2);
     for (let i = 0; i < n; i++) {
-      const p = origin
-        .clone()
-        .add(new THREE.Vector3(randRange(-0.85, 0.85), randRange(0.2, 1.0), randRange(-0.85, 0.85)));
       const initStage: AnimalLifeStage =
         i === 0 ? 'adult' : i === 1 ? getIntermediateStage(g) : 'spawn';
-      const a = this.spawnAnimal(g, p, initStage);
+      const a = this.launchAnimalFromVent(g, initStage, baseAz + (i / Math.max(1, n)) * Math.PI * 2);
       if (a) spawned.push(a);
     }
     if (g.reproduction === 'Egg_Layer' && this.eggs.length < CAPS.maxEggs) {
@@ -542,7 +718,8 @@ export class SimulationEngine implements SimulationContext {
   spawnAnimal(
     rawGenome: AnimalGenome,
     position: THREE.Vector3,
-    initialStage: boolean | AnimalLifeStage = 'adult'
+    initialStage: boolean | AnimalLifeStage = 'adult',
+    initialVelocity?: THREE.Vector3
   ): AnimalEntity | null {
     if (this.animals.length >= CAPS.maxAnimals) return null;
     const genome = normalizeAnimalGenome(rawGenome);
@@ -564,9 +741,14 @@ export class SimulationEngine implements SimulationContext {
     const stageLabel = getStageDisplayLabel(genome, lifeStage, maturity);
     const isImmature = lifeStage !== 'adult';
 
-    const vel = new THREE.Vector3(randRange(-1, 1), randRange(-0.25, 0.25), randRange(-1, 1));
-    safeNormalize(vel);
-    vel.multiplyScalar(genome.speed * 0.65);
+    let vel: THREE.Vector3;
+    if (initialVelocity && isFiniteVec3(initialVelocity) && initialVelocity.lengthSq() > 1e-6) {
+      vel = initialVelocity.clone();
+    } else {
+      vel = new THREE.Vector3(randRange(-1, 1), randRange(-0.25, 0.25), randRange(-1, 1));
+      safeNormalize(vel);
+      vel.multiplyScalar(genome.speed * 0.65);
+    }
 
     const entity: AnimalEntity = {
       id: allocateEntityId(),
@@ -617,6 +799,7 @@ export class SimulationEngine implements SimulationContext {
       wanderDir: new THREE.Vector3(randRange(-1, 1), randRange(-0.22, 0.22), randRange(-1, 1)).normalize(),
       wanderTimer: randRange(1.5, 4.0),
     };
+    safeOrientToward(entity.quaternion, entity.velocity, 1.0);
 
     this.animals.push(entity);
     this.speciesRegistry.registerAnimalBirth(genome, this.simTime);
@@ -901,7 +1084,9 @@ export class SimulationEngine implements SimulationContext {
     // Smooth post-pulse decay back to complete darkness (0.0) after a genesis eruption
     this.ventPulseEnergy = Math.max(0.0, this.ventPulseEnergy - dt * 0.28);
 
-    if (this.env.autoGenesisEnabled) {
+    this.updateInitialVentGenesis(dt);
+
+    if (this.env.autoGenesisEnabled && !this.isInitialVentGenesisActive()) {
       this.genesisCountdown -= dt;
       if (this.genesisCountdown <= 0) {
         this.genesisCountdown = this.env.genesisInterval;

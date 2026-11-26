@@ -442,7 +442,11 @@ export class HudController {
     setElText('stat-species', String(this.sim.getActiveSpeciesCount()));
     setElText(
       'stat-vent-timer',
-      this.sim.env.autoGenesisEnabled ? `${Math.max(0, Math.ceil(this.sim.genesisCountdown))}s` : 'OFF'
+      this.sim.isInitialVentGenesisActive()
+        ? 'ACTIVE'
+        : this.sim.env.autoGenesisEnabled
+        ? `${Math.max(0, Math.ceil(this.sim.genesisCountdown))}s`
+        : 'OFF'
     );
     setElText('stat-fps', String(fps));
 
